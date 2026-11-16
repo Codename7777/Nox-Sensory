@@ -136,6 +136,18 @@ def _contains_credential_parameter(component: str) -> bool:
     )
 
 
+def _is_loopback_host(hostname: str | None) -> bool:
+    """Nox fork: plain HTTP is allowed only to this machine (the local key relay)."""
+    if hostname is None:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
 def _is_valid_hostname(hostname: str) -> bool:
     """Validate an IP literal or an IDNA-compatible DNS hostname."""
     try:
@@ -358,7 +370,8 @@ class ProviderConfig(BaseModel):
             raise ValueError("base_url must not contain credentials")
         authority = parsed.netloc.rsplit("@", maxsplit=1)[-1]
         if (
-            parsed.scheme != "https"
+            parsed.scheme not in ("https", "http")
+            or (parsed.scheme == "http" and not _is_loopback_host(hostname))
             or hostname is None
             or not _is_valid_hostname(hostname)
             or authority.endswith(":")
