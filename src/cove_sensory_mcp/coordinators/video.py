@@ -8,9 +8,18 @@ from typing import Any
 from cove_sensory_mcp.errors import ErrorCode, SensoryError
 from cove_sensory_mcp.media.inspect import inspect_media
 from cove_sensory_mcp.media.types import MediaRange
-from cove_sensory_mcp.media.video import extract_video_audio, prepare_video
+from cove_sensory_mcp.media.video import (
+    _validate_range,
+    extract_video_audio,
+    prepare_video,
+)
 from cove_sensory_mcp.models import Modality
-from cove_sensory_mcp.providers.base import ProviderMediaLimits, ProviderRequest
+from cove_sensory_mcp.providers.base import (
+    MediaKind,
+    PreparedMedia,
+    ProviderMediaLimits,
+    ProviderRequest,
+)
 from cove_sensory_mcp.providers.executor import ExecutedObservation
 from cove_sensory_mcp.reports.merge import merge_video_observations
 from cove_sensory_mcp.reports.schemas import Coverage, ProviderUsage, VideoSensoryReport
@@ -22,6 +31,15 @@ from ._shared import (
     WorkspaceFactory,
     failure_warnings,
     provider_usage,
+)
+
+
+# Nox fork: big local videos are sent whole (uploaded once, cached) and the
+# requested range is applied remotely, instead of being re-encoded locally.
+NATIVE_RANGE_MIN_BYTES = 20 * 1024 * 1024
+NATIVE_RANGE_MAX_BYTES = 2 * 1024 * 1024 * 1024
+_NATIVE_RANGE_MIMES = frozenset(
+    {"video/mp4", "video/quicktime", "video/webm", "video/mpeg"}
 )
 
 
@@ -40,7 +58,9 @@ class VideoCoordinator:
         extract_audio: Processor = extract_video_audio,
         joint_video: bool = False,
         max_unbounded_duration: float = 600,
+        native_ranges: bool = False,
     ) -> None:
+        self._native_ranges = native_ranges
         self._resolver, self._workspace_factory, self._executor = (
             resolver,
             workspace_factory,
@@ -62,6 +82,31 @@ class VideoCoordinator:
         except SensoryError:
             return None
 
+    def _whole_source_clip(
+        self, source: Any, metadata: Any, media_range: MediaRange
+    ) -> PreparedMedia | None:
+        duration = metadata.duration_seconds
+        if (
+            not self._native_ranges
+            or source.source_kind != "local"
+            or not duration
+            or not NATIVE_RANGE_MIN_BYTES < source.original_size <= NATIVE_RANGE_MAX_BYTES
+            or metadata.mime_type not in _NATIVE_RANGE_MIMES
+        ):
+            return None
+        _validate_range(media_range, duration)
+        start = media_range.start_seconds or 0.0
+        end = media_range.end_seconds or duration
+        return PreparedMedia(
+            source.path,
+            metadata.mime_type,
+            MediaKind.VIDEO,
+            end - start,
+            clip_start=start,
+            clip_end=end,
+            reusable=True,
+        )
+
     async def sense(self, input: Any) -> VideoSensoryReport:
         media_range = MediaRange(
             start_seconds=input.start_seconds, end_seconds=input.end_seconds
@@ -80,14 +125,24 @@ class VideoCoordinator:
                     ErrorCode.LONG_MEDIA_CONFIRMATION_REQUIRED,
                     "Choose a time range for this long video.",
                 )
-            video = await self._prepare(
-                source,
-                metadata,
-                media_range,
-                self._visual_limits,
-                workspace,
-                self._runtime,
-            )
+            video = self._whole_source_clip(source, metadata, media_range)
+            if video is None:
+                video = await self._prepare(
+                    source,
+                    metadata,
+                    media_range,
+                    self._visual_limits,
+                    workspace,
+                    self._runtime,
+                )
+                if video.path == source.path and source.source_kind == "local":
+                    video = PreparedMedia(
+                        video.path,
+                        video.mime_type,
+                        video.media_kind,
+                        video.duration_seconds,
+                        reusable=True,
+                    )
             if self._joint and input.include_audio and metadata.has_audio:
                 modalities = frozenset({Modality.VIDEO_VISUAL, Modality.VIDEO_AUDIO})
                 joint = await self._execute(

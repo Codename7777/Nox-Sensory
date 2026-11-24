@@ -98,6 +98,7 @@ _ADAPTER_OPTION_NAMES = frozenset(
         "video_max_frames",
         "video_frame_width",
         "inline_video_audio",
+        "file_cache_path",
     }
 )
 _INVALID_ADAPTER_OPTIONS_MESSAGE = "Adapter options contain an unsupported field."
@@ -230,6 +231,9 @@ class AdapterOptions(BaseModel):
     # Nox fork: let the native Gemini adapter send small video/audio inline
     # (generateContent inline_data) instead of always using the File API.
     inline_video_audio: StrictBool | None = None
+    # Nox fork: where the native Gemini adapter remembers File API uploads of
+    # original files so they are uploaded once and reused (~48 h).
+    file_cache_path: StrictStr | None = Field(default=None, min_length=1, max_length=1024)
     extra_headers_env: Annotated[
         dict[StrictStr, StrictStr],
         Field(max_length=_MAX_EXTRA_HEADERS),

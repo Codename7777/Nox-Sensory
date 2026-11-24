@@ -19,6 +19,7 @@ from cove_sensory_mcp.reports.normalize import normalize_provider_text
 from cove_sensory_mcp.reports.prompts import build_sensory_prompt
 
 from .base import MediaKind, ProviderCallResult, ProviderRequest
+from .gemini_file_cache import GeminiFileCache
 
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_INLINE_MAX_BYTES = 20 * 1024 * 1024
@@ -38,6 +39,40 @@ _TIMEOUT_MESSAGE = "The provider request timed out."
 _UNAVAILABLE_MESSAGE = "The provider is temporarily unavailable."
 _CAPABILITY_MESSAGE = "The provider cannot process the requested media modalities."
 _TaskResult = TypeVar("_TaskResult")
+_JOINT_VIDEO = frozenset({Modality.VIDEO_VISUAL, Modality.VIDEO_AUDIO})
+
+
+def shift_observations(
+    observations: dict[Modality, Any],
+    offset: float,
+    duration: float | None,
+) -> dict[Modality, Any]:
+    """Nox fork: turn source-video times into excerpt-relative times."""
+
+    def shift(items: list[Any]) -> list[Any]:
+        shifted = []
+        for item in items:
+            start = max(0.0, item.start_seconds - offset)
+            end = item.end_seconds - offset
+            if duration is not None:
+                end = min(duration, end)
+            if end > start:
+                shifted.append(
+                    item.model_copy(
+                        update={"start_seconds": round(start, 3), "end_seconds": round(end, 3)}
+                    )
+                )
+        return shifted
+
+    return {
+        modality: envelope.model_copy(
+            update={
+                "segments": shift(envelope.segments),
+                "transcript": shift(envelope.transcript),
+            }
+        )
+        for modality, envelope in observations.items()
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +89,8 @@ class GeminiUploadedMedia:
 
     uri: str
     mime_type: str
+    start_offset: float | None = None
+    end_offset: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -306,6 +343,18 @@ class _OfficialGoogleGenAIClient:
                         mime_type=content.mime_type,
                     )
                 )
+            elif content.start_offset is not None:
+                parts.append(
+                    self._types.Part(
+                        file_data=self._types.FileData(
+                            file_uri=content.uri, mime_type=content.mime_type
+                        ),
+                        video_metadata=self._types.VideoMetadata(
+                            start_offset=f"{content.start_offset:.3f}s",
+                            end_offset=f"{content.end_offset:.3f}s",
+                        ),
+                    )
+                )
             else:
                 parts.append(
                     self._types.Part.from_uri(
@@ -474,12 +523,24 @@ class GeminiProvider:
         self._secret_store = secret_store
         self._client_factory = client_factory or _official_client_factory
 
+    # Nox fork: honours PreparedMedia.clip_start/clip_end via videoMetadata.
+    supports_clip_ranges = True
+
+    def supports_joint(self, modalities: frozenset[Modality]) -> bool:
+        """Gemini watches and hears one video in a single request."""
+        declared = {m for m, on in self._config.declared_capabilities.items() if on}
+        return modalities == _JOINT_VIDEO and modalities <= declared
+
+    def _file_cache(self) -> GeminiFileCache | None:
+        path = self._config.adapter_options.file_cache_path
+        return GeminiFileCache(path) if path else None
+
     def _credential(self) -> str:
         reference = self._config.credential_ref or self._provider_id
         return self._secret_store.get(reference, self._config.api_key_env)
 
     def _prompt(self, request: ProviderRequest) -> str:
-        return build_sensory_prompt(
+        prompt = build_sensory_prompt(
             request.requested_modalities,
             request.question or None,
             request.detail,
@@ -487,6 +548,14 @@ class GeminiProvider:
             request.start_seconds,
             request.end_seconds,
         )
+        media = request.media
+        if media.clip_start is not None and media.clip_end is not None:
+            prompt += (
+                f"\nThe video is limited to the excerpt from {media.clip_start:.1f} s to "
+                f"{media.clip_end:.1f} s of the source. Give every segment and transcript "
+                "time in source-video seconds (within that excerpt)."
+            )
+        return prompt
 
     async def _prepare_media(
         self,
@@ -504,6 +573,7 @@ class GeminiProvider:
         )
         if (
             request.media.media_kind in inline_kinds
+            and request.media.clip_start is None
             and request.media.path.stat().st_size <= inline_limit
         ):
             inline = GeminiInlineMedia(
@@ -512,11 +582,37 @@ class GeminiProvider:
             )
             return inline, None
 
+        if (request.media.reusable or request.media.clip_start is not None) and (
+            self._file_cache() is not None
+        ):
+            return None, None  # sense() takes the cached-upload path
         uploaded = await client.upload_file(
             path=request.media.path,
             mime_type=request.media.mime_type,
         )
         return None, uploaded
+
+    async def _cached_upload(
+        self, client: GeminiClient, request: ProviderRequest
+    ) -> GeminiRemoteFile:
+        """Reuse a still-valid upload of this exact file, or upload it once."""
+        cache = self._file_cache()
+        assert cache is not None
+        path = request.media.path
+        hit = await asyncio.to_thread(cache.get, path)
+        if hit is not None:
+            try:
+                return await client.wait_until_active(
+                    GeminiRemoteFile(name=hit.name, uri=hit.uri, mime_type=hit.mime_type)
+                )
+            except GeminiClientFailure:
+                await asyncio.to_thread(cache.forget, path)
+        uploaded = await client.upload_file(path=path, mime_type=request.media.mime_type)
+        active = await client.wait_until_active(uploaded)
+        await asyncio.to_thread(
+            cache.put, path, name=active.name, uri=active.uri, mime_type=active.mime_type
+        )
+        return active
 
     def _ordered_contents(
         self,
@@ -565,17 +661,21 @@ class GeminiProvider:
                             client,
                             request,
                         )
-                        if remote_file is None:
-                            if inline_media is None:
-                                raise GeminiClientFailure(
-                                    GeminiFailureKind.UNAVAILABLE
-                                )
+                        if remote_file is None and inline_media is None:
+                            remote_file = await self._cached_upload(client, request)
+                            remote_file_deleted = False
+                            active_file = remote_file
+                            remote_file = None  # cached: never delete after use
+                        elif remote_file is not None:
+                            active_file = await client.wait_until_active(remote_file)
+                        if inline_media is not None:
                             media: GeminiInlineMedia | GeminiUploadedMedia = inline_media
                         else:
-                            active_file = await client.wait_until_active(remote_file)
                             media = GeminiUploadedMedia(
                                 uri=active_file.uri,
                                 mime_type=active_file.mime_type,
+                                start_offset=request.media.clip_start,
+                                end_offset=request.media.clip_end,
                             )
                         temperature = self._config.adapter_options.temperature
                         if temperature is None:
@@ -602,7 +702,11 @@ class GeminiProvider:
                                 batch = normalize_provider_text(
                                     generation.text,
                                     expected_modalities=request.requested_modalities,
-                                    duration_seconds=request.media.duration_seconds,
+                                    duration_seconds=(
+                                        request.media.clip_end
+                                        if request.media.clip_start is not None
+                                        else request.media.duration_seconds
+                                    ),
                                 )
                             except SensoryError as exc:
                                 if (
@@ -613,6 +717,12 @@ class GeminiProvider:
                                     raise
                                 continue
                             observations = batch.by_modality()
+                            if request.media.clip_start is not None:
+                                observations = shift_observations(
+                                    observations,
+                                    request.media.clip_start,
+                                    request.media.duration_seconds,
+                                )
                             break
                 except TimeoutError:
                     pending_error = _public_error(GeminiFailureKind.TIMEOUT)

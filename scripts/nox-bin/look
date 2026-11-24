@@ -1,0 +1,13 @@
+#!/home/knight/Nox-Sensory/.venv/bin/python
+"""look — 看一张图或一段视频（Nox-Sensory，原生 Gemini，帧采样兜底）。
+
+  look PATH [-q "问题"] [--start S --end E] [--detail quick|auto|detailed] [--no-audio] [--json]
+
+视频连声音一起看；大文件只传一次（~/nox-state/sensory/files.json 记着，约 46 小时），
+--start/--end 只看那一段。不在允许目录里的文件会先链接/复制到 ~/nox-state/sensory/staging。
+"""
+import os, sys
+os.environ.setdefault("NOX_RELAY_KEY", "nox-relay-placeholder")  # 传话筒自己换真钥匙
+sys.argv[0] = "look"
+from cove_sensory_mcp.nox_cli import main
+sys.exit(main("look"))

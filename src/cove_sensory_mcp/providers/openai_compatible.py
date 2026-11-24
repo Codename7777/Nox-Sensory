@@ -537,6 +537,11 @@ class OpenAICompatibleProvider:
             trust_env=False,
         )
 
+    @property
+    def supports_clip_ranges(self) -> bool:
+        """Nox fork: only the frame-sampling mode can read an untrimmed source."""
+        return self._mode == _INLINE_MODE
+
     def supports_joint(self, modalities: frozenset[Modality]) -> bool:
         """Nox fork: one request can carry both video channels in inline mode."""
         return (

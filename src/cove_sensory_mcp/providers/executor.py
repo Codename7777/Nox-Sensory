@@ -184,7 +184,11 @@ class ProviderExecutor:
                 joint = self._router.joint_candidate(requested_modalities)
                 if joint is None:
                     raise _joint_not_verified_error()
-                candidates = (_snapshot_candidate(joint),)
+                fallbacks = getattr(self._router, "joint_fallbacks", None)
+                extra = tuple(fallbacks(requested_modalities)) if fallbacks else ()
+                candidates = tuple(
+                    _snapshot_candidate(candidate) for candidate in (joint, *extra)
+                )
         except SensoryError:
             raise
         except Exception:  # noqa: BLE001 - sanitize a malformed router boundary

@@ -209,7 +209,18 @@ class AppServices:
             )
             is not None
         )
+        native_ranges = True
+        for modality in (Modality.VIDEO_VISUAL, Modality.VIDEO_AUDIO):
+            try:
+                candidates = router.candidates(modality)
+            except SensoryError:
+                continue
+            for candidate in candidates:
+                adapter = provider_map.get(candidate.provider_id)
+                if not getattr(adapter, "supports_clip_ranges", False):
+                    native_ranges = False
         return VideoCoordinator(
+            native_ranges=native_ranges,
             resolver=resolver,
             workspace_factory=workspace_factory,
             executor=executor,

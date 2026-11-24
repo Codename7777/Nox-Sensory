@@ -110,3 +110,44 @@ class ProviderRouter:
             expected_model=provider.model,
             modalities=modalities,
         )
+
+    def joint_fallbacks(
+        self,
+        modalities: frozenset[Modality],
+    ) -> list[ProviderCandidate]:
+        """Nox fork: authorized fallbacks shared by every route of a joint request.
+
+        A fallback qualifies only when it is authorized in each route, verified
+        for each modality, and verified for the exact joint capability.
+        """
+        if len(modalities) < 2:
+            return []
+        shared: list[ProviderId] | None = None
+        for modality in sorted(modalities, key=lambda item: item.value):
+            route = self._route(modality)
+            if route is None:
+                return []
+            authorized = [ref.provider for ref in route.fallbacks if ref.authorized]
+            shared = (
+                authorized
+                if shared is None
+                else [provider for provider in shared if provider in authorized]
+            )
+        candidates: list[ProviderCandidate] = []
+        for provider_id in shared or []:
+            provider = self._config.providers.get(provider_id)
+            if (
+                provider is None
+                or not all(provider.verified_capabilities.get(m, False) for m in modalities)
+                or modalities not in provider.verified_joint_capabilities
+            ):
+                continue
+            candidates.append(
+                ProviderCandidate(
+                    provider_id=provider_id,
+                    expected_model=provider.model,
+                    modalities=modalities,
+                    is_fallback=True,
+                )
+            )
+        return candidates

@@ -306,3 +306,29 @@ async def test_verifier_records_joint_video_only_when_the_joint_call_passes(
     assert fake.calls[-1] == JOINT
     saved = store.load().providers["relay"]
     assert (JOINT in saved.verified_joint_capabilities) is joint_ok
+
+
+@needs_ffmpeg
+@pytest.mark.asyncio
+async def test_frame_fallback_reads_a_clip_of_an_untrimmed_source() -> None:
+    captured: list[dict[str, Any]] = []
+    request = ProviderRequest(
+        media=PreparedMedia(
+            ASSETS / "motion.mp4", "video/mp4", MediaKind.VIDEO, 1.0,
+            clip_start=0.5, clip_end=1.5, reusable=True,
+        ),
+        requested_modalities=JOINT,
+        question="",
+        detail=DetailLevel.QUICK,
+        language="en",
+        start_seconds=0.5,
+        end_seconds=1.5,
+    )
+    provider = _provider(captured)
+    assert provider.supports_clip_ranges
+    await provider.sense(request)
+    content = captured[0]["messages"][0]["content"]
+    assert "begins at 0.5 s of the source" in content[0]["text"]
+    labels = [p["text"] for p in content if p["type"] == "text" and p["text"].startswith("[frame")]
+    assert labels[0] == "[frame 1/4 at t=0.1s]"          # excerpt-relative labels
+    assert [p["type"] for p in content].count("input_audio") == 1

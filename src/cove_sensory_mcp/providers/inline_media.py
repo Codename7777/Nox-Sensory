@@ -178,11 +178,18 @@ async def _extract_frame(
     return _returncode(result) == 0 and output.is_file() and output.stat().st_size > 0
 
 
-async def _extract_audio(runtime: FfmpegRunner, video: Path, output: Path) -> bool:
+async def _extract_audio(
+    runtime: FfmpegRunner,
+    video: Path,
+    output: Path,
+    clip: tuple[float, float] | None = None,
+) -> bool:
+    window = ["-ss", f"{clip[0]:.3f}", "-to", f"{clip[1]:.3f}"] if clip else []
     result = await runtime.run_ffmpeg(
         [
             "-v",
             "error",
+            *window,
             "-i",
             str(video),
             "-vn",
@@ -268,7 +275,11 @@ async def build_inline_parts(
     runtime: FfmpegRunner = runtime_factory()  # type: ignore[operator]
     want_visual = Modality.VIDEO_VISUAL in request.requested_modalities
     want_audio = Modality.VIDEO_AUDIO in request.requested_modalities
-    duration = media.duration_seconds or await _probe_duration(runtime, media.path)
+    base = media.clip_start or 0.0
+    clip = (media.clip_start, media.clip_end) if media.clip_start is not None else None
+    duration = media.duration_seconds or (
+        clip[1] - clip[0] if clip else await _probe_duration(runtime, media.path)
+    )
     times = frame_times(duration, sampling) if want_visual else []
 
     with tempfile.TemporaryDirectory(prefix="cove-frames-") as scratch:
@@ -279,7 +290,9 @@ async def build_inline_parts(
 
         async def one(at: float, output: Path) -> bool:
             async with gate:
-                return await _extract_frame(runtime, media.path, at, sampling.width, output)
+                return await _extract_frame(
+                    runtime, media.path, base + at, sampling.width, output
+                )
 
         frame_ok = (
             await asyncio.gather(*(one(at, out) for at, out in zip(times, frame_paths)))
@@ -289,7 +302,11 @@ async def build_inline_parts(
         if want_visual and not any(frame_ok):
             raise SensoryError(ErrorCode.UNSUPPORTED_MEDIA_TYPE, _FRAME_FAILURE_MESSAGE)
         audio_path = root / "audio.mp3"
-        has_audio = await _extract_audio(runtime, media.path, audio_path) if want_audio else None
+        has_audio = (
+            await _extract_audio(runtime, media.path, audio_path, clip)  # type: ignore[arg-type]
+            if want_audio
+            else None
+        )
         kept = [(at, path) for at, path, ok in zip(times, frame_paths, frame_ok) if ok]
 
         built.parts.append(

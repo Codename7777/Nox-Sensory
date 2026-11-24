@@ -881,6 +881,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     sense_parser.add_argument(
         "--json", action="store_true", help="Print the full structured report as JSON."
     )
+    ask_parser = subparsers.add_parser(
+        "ask",
+        help="Free-form prompt about one file via native Gemini; prints the raw reply.",
+    )
+    ask_parser.add_argument("path")
+    ask_parser.add_argument(
+        "--prompt", default=None, help="Prompt text; omitted = read from stdin."
+    )
+    ask_parser.add_argument("--start", type=float, default=None, dest="start_seconds")
+    ask_parser.add_argument("--end", type=float, default=None, dest="end_seconds")
+    ask_parser.add_argument("--json", action="store_true", help="Ask for a JSON reply.")
+    ask_parser.add_argument("--temperature", type=float, default=0.2)
+    ask_parser.add_argument("--model", default=None)
     print_config_parser = subparsers.add_parser(
         "print-config", help="Print a secret-free local stdio MCP client configuration."
     )
@@ -918,6 +931,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             input_fn=input,
             yes=args.yes,
         )
+    if args.command == "ask":
+        from .api import ask
+
+        prompt = args.prompt if args.prompt is not None else sys.stdin.read()
+        try:
+            print(
+                ask(
+                    args.path,
+                    prompt,
+                    start_seconds=args.start_seconds,
+                    end_seconds=args.end_seconds,
+                    json_output=args.json,
+                    temperature=args.temperature,
+                    model=args.model,
+                )
+            )
+        except Exception as error:  # noqa: BLE001 - CLI reports the failure type only
+            print(f"ask failed: {type(error).__name__}: {str(error)[:300]}", file=sys.stderr)
+            return 1
+        return 0
     if args.command == "sense":
         return run_sense(_build_services(), args, output=print)
     if args.command == "print-config":

@@ -30,8 +30,24 @@ class PreparedMedia:
     duration_seconds: float | None
     is_animated: bool = False
     sequence_index: int = 0
+    # Nox fork: when clip_start is set, ``path`` is the whole untrimmed source
+    # and the request covers [clip_start, clip_end] of it; duration_seconds is
+    # the excerpt length.  Adapters that set ``supports_clip_ranges`` honour it.
+    clip_start: float | None = None
+    clip_end: float | None = None
+    # Nox fork: ``path`` is the user's original file (not a job artifact), so a
+    # remote upload of it may be cached and reused.
+    reusable: bool = False
 
     def __post_init__(self) -> None:
+        if self.clip_start is not None and (
+            self.clip_end is None
+            or not math.isfinite(self.clip_start)
+            or not math.isfinite(self.clip_end)
+            or self.clip_start < 0
+            or self.clip_end <= self.clip_start
+        ):
+            raise ValueError("clip range must be finite, ordered and non-negative")
         if not self.mime_type or len(self.mime_type) > 255:
             raise ValueError("mime_type must contain one bounded media type")
         if self.duration_seconds is not None and (

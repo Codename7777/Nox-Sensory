@@ -1,0 +1,12 @@
+#!/home/knight/Nox-Sensory/.venv/bin/python
+"""listen — 听一段声音（Nox-Sensory）。
+
+  listen PATH [-q "问题"] [--music] [--start S --end E] [--detail …] [--json]
+
+默认按说话/声音听（带转写）；--music 按音乐听（结构、节奏、配器）。视频文件也行，只听声音。
+"""
+import os, sys
+os.environ.setdefault("NOX_RELAY_KEY", "nox-relay-placeholder")
+sys.argv[0] = "listen"
+from cove_sensory_mcp.nox_cli import main
+sys.exit(main("listen"))
