@@ -497,8 +497,13 @@ class GeminiProvider:
             self._config.adapter_options.inline_max_bytes
             or _DEFAULT_INLINE_MAX_BYTES
         )
+        inline_kinds = (
+            {MediaKind.IMAGE, MediaKind.VIDEO, MediaKind.AUDIO}
+            if self._config.adapter_options.inline_video_audio
+            else {MediaKind.IMAGE}
+        )
         if (
-            request.media.media_kind is MediaKind.IMAGE
+            request.media.media_kind in inline_kinds
             and request.media.path.stat().st_size <= inline_limit
         ):
             inline = GeminiInlineMedia(

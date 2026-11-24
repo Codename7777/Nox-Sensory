@@ -19,6 +19,7 @@ from .assets import SelfTestAssetStore
 _CONFIG_MESSAGE = "The provider verification configuration is invalid."
 _ABORT_MESSAGE = "The capability self-test could not run safely."
 _FOCUS = "Direct observations from the capability test media."
+_JOINT_VIDEO = frozenset({Modality.VIDEO_VISUAL, Modality.VIDEO_AUDIO})
 
 _BATCH_ABORT_CODES = frozenset(
     {
@@ -65,6 +66,22 @@ def _verification_overlay(
     provider = overlay.providers[provider_id]
     provider.verified_capabilities[modality] = True
     setattr(overlay.routes, modality.value, RouteConfig(primary=provider_id))
+    return AppConfig.model_validate(overlay.model_dump(mode="python"))
+
+
+def _joint_overlay(
+    config: AppConfig,
+    provider_id: str,
+    modalities: frozenset[Modality],
+) -> AppConfig:
+    """Authorize one in-memory joint route for a joint self-test only."""
+    overlay = config.model_copy(deep=True)
+    provider = overlay.providers[provider_id]
+    for modality in modalities:
+        provider.verified_capabilities[modality] = True
+        setattr(overlay.routes, modality.value, RouteConfig(primary=provider_id))
+    if modalities not in provider.verified_joint_capabilities:
+        provider.verified_joint_capabilities.append(modalities)
     return AppConfig.model_validate(overlay.model_dump(mode="python"))
 
 
@@ -153,6 +170,8 @@ class CapabilityVerifier:
                 )
             )
 
+        joint_verified = await self._verify_joint_video(provider_id, starting, results)
+
         verified_at = self._now()
         if verified_at.tzinfo is None or verified_at.utcoffset() is None:
             raise _config_error()
@@ -178,8 +197,52 @@ class CapabilityVerifier:
                 joint
                 for joint in latest_provider.verified_joint_capabilities
                 if joint <= verified_modalities
+                and not (joint == _JOINT_VIDEO and joint_verified is False)
             ]
+            if (
+                joint_verified
+                and _JOINT_VIDEO <= verified_modalities
+                and _JOINT_VIDEO not in latest_provider.verified_joint_capabilities
+            ):
+                latest_provider.verified_joint_capabilities.append(_JOINT_VIDEO)
             latest_provider.last_verified_at = verified_at.astimezone(UTC)
 
         self._config_store.update(merge_results)
         return results
+
+    async def _verify_joint_video(
+        self,
+        provider_id: str,
+        starting: AppConfig,
+        results: list[VerificationResult],
+    ) -> bool | None:
+        """Nox fork: test one combined eye+ear video call when the adapter offers it.
+
+        Returns None when no joint test applies, otherwise whether it passed.
+        """
+        passed = {result.modality for result in results if result.verified}
+        if not _JOINT_VIDEO <= passed:
+            return None
+        try:
+            adapter = self._registry.get(provider_id)
+        except SensoryError:
+            return None
+        supports = getattr(adapter, "supports_joint", None)
+        if not callable(supports) or not supports(_JOINT_VIDEO):
+            return None
+        media = self._assets.get(Modality.VIDEO_VISUAL)
+        executor = ProviderExecutor(
+            router=ProviderRouter(_joint_overlay(starting, provider_id, _JOINT_VIDEO)),
+            registry=self._registry,
+        )
+        executed = await executor.sense(
+            _JOINT_VIDEO,
+            ProviderRequest(
+                media=media,
+                requested_modalities=_JOINT_VIDEO,
+                question=_FOCUS,
+                detail=DetailLevel.QUICK,
+                language="en",
+            ),
+        )
+        return frozenset(executed.observations) == _JOINT_VIDEO

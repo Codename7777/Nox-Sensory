@@ -84,6 +84,7 @@ _MAX_OUTPUT_TOKENS = 1_000_000
 _MAX_REQUEST_TIMEOUT_SECONDS = 3_600
 _MAX_ENDPOINT_PATH_LENGTH = 1_024
 _MAX_PROVIDER_MODEL_LENGTH = 256
+_MAX_VIDEO_FRAMES = 48
 _ADAPTER_OPTION_NAMES = frozenset(
     {
         "inline_max_bytes",
@@ -93,6 +94,10 @@ _ADAPTER_OPTION_NAMES = frozenset(
         "endpoint_path",
         "media_part_mode",
         "extra_headers_env",
+        "video_frame_interval_seconds",
+        "video_max_frames",
+        "video_frame_width",
+        "inline_video_audio",
     }
 )
 _INVALID_ADAPTER_OPTIONS_MESSAGE = "Adapter options contain an unsupported field."
@@ -206,7 +211,25 @@ class AdapterOptions(BaseModel):
         "video_url_data_uri",
         "anthropic_base64_media",
         "audio_url_data_uri",
+        "multimodal_inline",
     ] | None = None
+    # Nox fork: frame sampling for the "multimodal_inline" wire mode, where a
+    # video is sent as ordered still frames plus its audio track.
+    video_frame_interval_seconds: Annotated[
+        float,
+        Field(strict=True, gt=0, le=600, allow_inf_nan=False),
+    ] | None = None
+    video_max_frames: Annotated[
+        int,
+        Field(strict=True, gt=0, le=_MAX_VIDEO_FRAMES),
+    ] | None = None
+    video_frame_width: Annotated[
+        int,
+        Field(strict=True, ge=64, le=4096),
+    ] | None = None
+    # Nox fork: let the native Gemini adapter send small video/audio inline
+    # (generateContent inline_data) instead of always using the File API.
+    inline_video_audio: StrictBool | None = None
     extra_headers_env: Annotated[
         dict[StrictStr, StrictStr],
         Field(max_length=_MAX_EXTRA_HEADERS),

@@ -1309,3 +1309,43 @@ async def test_official_wrapper_close_survives_two_cancellations(
         await task
     assert sdk_client.async_close_calls == 1
     assert sdk_client.sync_close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_inline_video_audio_option_sends_small_video_inline(tmp_path: Path) -> None:
+    """Nox fork: small clips go inline through generateContent, no File API upload."""
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    config = _config()
+    config.adapter_options.inline_video_audio = True
+    joint = frozenset({Modality.VIDEO_VISUAL, Modality.VIDEO_AUDIO})
+    client = FakeGeminiClient(GeminiGeneration(text=_response_text(*joint)))
+
+    result = await _provider(client, config=config).sense(
+        _request(
+            video,
+            media_kind=MediaKind.VIDEO,
+            mime_type="video/mp4",
+            modalities=joint,
+            duration_seconds=8,
+        )
+    )
+
+    contents = cast(tuple[object, ...], client.generate_calls[0]["contents"])
+    assert contents[0] == GeminiInlineMedia(data=b"video", mime_type="video/mp4")
+    assert client.uploads == []
+    assert set(result.observations) == joint
+
+    big = tmp_path / "big.mp4"
+    big.write_bytes(b"v" * 65)
+    client = FakeGeminiClient(GeminiGeneration(text=_response_text(*joint)))
+    await _provider(client, config=config).sense(
+        _request(
+            big,
+            media_kind=MediaKind.VIDEO,
+            mime_type="video/mp4",
+            modalities=joint,
+            duration_seconds=8,
+        )
+    )
+    assert client.uploads == [(big, "video/mp4")]

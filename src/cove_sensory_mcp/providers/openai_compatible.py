@@ -21,6 +21,14 @@ from cove_sensory_mcp.reports.normalize import normalize_provider_text
 from cove_sensory_mcp.reports.prompts import build_sensory_prompt
 
 from .base import MediaKind, ProviderCallResult, ProviderRequest
+from .inline_media import (
+    DEFAULT_FRAME_INTERVAL_SECONDS,
+    DEFAULT_FRAME_WIDTH,
+    DEFAULT_MAX_FRAMES,
+    FrameSampling,
+    InlineParts,
+    build_inline_parts,
+)
 
 _DEFAULT_MAX_BYTES = 200 * 1024 * 1024
 _DEFAULT_MAX_OUTPUT_TOKENS = 4_096
@@ -209,7 +217,11 @@ _MEDIA_BUILDERS = {
     "video_url_data_uri": _build_video_url_data_uri,
     "anthropic_base64_media": _build_anthropic_base64_media,
     "audio_url_data_uri": _build_audio_url_data_uri,
+    # Nox fork: parts are built by inline_media.build_inline_parts instead.
+    "multimodal_inline": None,
 }
+_INLINE_MODE = "multimodal_inline"
+_JOINT_VIDEO = frozenset({Modality.VIDEO_VISUAL, Modality.VIDEO_AUDIO})
 
 _MODE_CAPABILITIES = {
     "image_url_data_uri": frozenset({Modality.IMAGE}),
@@ -225,6 +237,7 @@ _MODE_CAPABILITIES = {
     "audio_url_data_uri": frozenset(
         {Modality.VIDEO_AUDIO, Modality.AUDIO, Modality.MUSIC}
     ),
+    "multimodal_inline": frozenset(Modality),
 }
 
 
@@ -240,6 +253,8 @@ def _request_is_compatible(
     mode: str,
     declared_capabilities: frozenset[Modality],
 ) -> bool:
+    if mode == _INLINE_MODE:
+        return _inline_request_is_compatible(request, declared_capabilities)
     if len(request.requested_modalities) != 1:
         return False
     modality = next(iter(request.requested_modalities))
@@ -263,6 +278,32 @@ def _request_is_compatible(
         request.media.media_kind is MediaKind.VIDEO
         and modality is Modality.VIDEO_VISUAL
         and mime_kind == "video"
+    )
+
+
+def _inline_request_is_compatible(
+    request: ProviderRequest,
+    declared_capabilities: frozenset[Modality],
+) -> bool:
+    requested = request.requested_modalities
+    if not requested or not requested <= declared_capabilities:
+        return False
+    mime_match = _MIME_TYPE.fullmatch(request.media.mime_type)
+    if mime_match is None:
+        return False
+    mime_kind = mime_match.group(1)
+    kind = request.media.media_kind
+    if len(requested) > 1:
+        return requested == _JOINT_VIDEO and kind is MediaKind.VIDEO and mime_kind == "video"
+    modality = next(iter(requested))
+    if modality is Modality.IMAGE:
+        return kind is MediaKind.IMAGE and mime_kind == "image"
+    if modality in {Modality.AUDIO, Modality.MUSIC}:
+        return kind is MediaKind.AUDIO and mime_kind == "audio"
+    if modality is Modality.VIDEO_VISUAL:
+        return kind is MediaKind.VIDEO and mime_kind == "video"
+    return (kind is MediaKind.AUDIO and mime_kind == "audio") or (
+        kind is MediaKind.VIDEO and mime_kind == "video"
     )
 
 
@@ -462,6 +503,7 @@ class OpenAICompatibleProvider:
         config: ProviderConfig,
         secret_store: SecretStore,
         client: httpx.AsyncClient | None = None,
+        media_runtime: object | None = None,
     ) -> None:
         mode = config.adapter_options.media_part_mode
         endpoint_path = config.adapter_options.endpoint_path
@@ -488,11 +530,57 @@ class OpenAICompatibleProvider:
         self._mode = mode
         self._declared_capabilities = declared
         self._endpoint = f"{config.base_url}{endpoint_path}"
+        self._media_runtime = media_runtime
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             follow_redirects=False,
             trust_env=False,
         )
+
+    def supports_joint(self, modalities: frozenset[Modality]) -> bool:
+        """Nox fork: one request can carry both video channels in inline mode."""
+        return (
+            self._mode == _INLINE_MODE
+            and modalities == _JOINT_VIDEO
+            and modalities <= self._declared_capabilities
+        )
+
+    def _runtime(self) -> object:
+        if self._media_runtime is None:
+            from cove_sensory_mcp.media.runtime import MediaRuntime
+
+            self._media_runtime = MediaRuntime.discover(
+                None, None, os.environ.get("PATH")
+            )
+        return self._media_runtime
+
+    def _frame_sampling(self) -> FrameSampling:
+        options = self._config.adapter_options
+        return FrameSampling(
+            interval_seconds=(
+                options.video_frame_interval_seconds or DEFAULT_FRAME_INTERVAL_SECONDS
+            ),
+            max_frames=options.video_max_frames or DEFAULT_MAX_FRAMES,
+            width=options.video_frame_width or DEFAULT_FRAME_WIDTH,
+        )
+
+    async def _inline_parts(self, request: ProviderRequest) -> list[dict[str, object]]:
+        try:
+            built: InlineParts = await build_inline_parts(
+                request,
+                runtime_factory=self._runtime,
+                sampling=self._frame_sampling(),
+                max_bytes=self._max_bytes(),
+            )
+        except asyncio.CancelledError:
+            raise
+        except SensoryError:
+            raise
+        except Exception:  # noqa: BLE001 - privacy boundary discards internals
+            raise _public_error(_FailureKind.UNAVAILABLE) from None
+        parts = list(built.parts)
+        built.clear()
+        return parts
 
     def _max_bytes(self) -> int:
         return self._config.adapter_options.inline_max_bytes or _DEFAULT_MAX_BYTES
@@ -557,6 +645,34 @@ class OpenAICompatibleProvider:
         ):
             raise _public_error(_FailureKind.CAPABILITY)
 
+        if self._mode == _INLINE_MODE:
+            media_parts = await self._inline_parts(request)
+        else:
+            media_parts = [self._single_media_part(request)]
+        prompt = self._prompt(request)
+        text_part = {"type": "text", "text": prompt}
+        payload: dict[str, object] = {
+            "model": self._config.model,
+            "max_tokens": (
+                self._config.adapter_options.max_output_tokens
+                or _DEFAULT_MAX_OUTPUT_TOKENS
+            ),
+            "temperature": (
+                _DEFAULT_TEMPERATURE
+                if self._config.adapter_options.temperature is None
+                else self._config.adapter_options.temperature
+            ),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [*media_parts, text_part],
+                }
+            ],
+        }
+        media_parts = []
+        return await self._send(request, payload, prompt, text_part)
+
+    def _single_media_part(self, request: ProviderRequest) -> dict[str, object]:
         try:
             size = request.media.path.stat().st_size
         except OSError:
@@ -577,33 +693,23 @@ class OpenAICompatibleProvider:
 
         encoded_media = base64.b64encode(media_bytes).decode("ascii")
         media_bytes = b""
-        prompt = self._prompt(request)
-        media_part = _MEDIA_BUILDERS[self._mode](
+        builder = _MEDIA_BUILDERS[self._mode]
+        assert builder is not None
+        media_part = builder(
             encoded_media,
             request.media.mime_type,
             request.media.media_kind,
         )
         encoded_media = ""
-        text_part = {"type": "text", "text": prompt}
-        payload: dict[str, object] = {
-            "model": self._config.model,
-            "max_tokens": (
-                self._config.adapter_options.max_output_tokens
-                or _DEFAULT_MAX_OUTPUT_TOKENS
-            ),
-            "temperature": (
-                _DEFAULT_TEMPERATURE
-                if self._config.adapter_options.temperature is None
-                else self._config.adapter_options.temperature
-            ),
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [media_part, text_part],
-                }
-            ],
-        }
-        media_part = {}
+        return media_part
+
+    async def _send(
+        self,
+        request: ProviderRequest,
+        payload: dict[str, object],
+        prompt: str,
+        text_part: dict[str, str],
+    ) -> ProviderCallResult:
         credential = self._credential()
         backoff = _RETRY_BACKOFF_START
         try:

@@ -21,7 +21,7 @@ from .config.paths import AppPaths
 from .config.schema import AdapterOptions, AppConfig, ProviderConfig
 from .config.secrets import KeyringSecretStore
 from .config.store import ConfigStore
-from .errors import ErrorCode, SensoryError
+from .errors import ErrorCode, SensoryError, error_result
 from .models import Modality, ProviderId, ProviderRef, RouteConfig
 from .providers.openai_compatible import media_part_mode_capabilities
 from .server import run_stdio
@@ -45,6 +45,7 @@ CustomMediaPartMode = Literal[
     "video_url_data_uri",
     "anthropic_base64_media",
     "audio_url_data_uri",
+    "multimodal_inline",
 ]
 _PROVIDER_ID_ADAPTER = TypeAdapter(ProviderId)
 _CANCEL_VALUES = frozenset({"cancel", "quit", "q"})
@@ -175,7 +176,8 @@ def _provider_from_answers(
         media_part_mode_value = _clean_answer(
             input_fn,
             "Media part mode [image_url_data_uri/input_audio_base64/"
-            "video_url_data_uri/anthropic_base64_media/audio_url_data_uri]: ",
+            "video_url_data_uri/anthropic_base64_media/audio_url_data_uri/"
+            "multimodal_inline]: ",
         ).lower()
         supported_capabilities = media_part_mode_capabilities(media_part_mode_value)
         if supported_capabilities is None:
@@ -807,6 +809,38 @@ def run_self_test(
     return 1 if result.get("status") == "error" else 0
 
 
+def run_sense(services: AppServices, args: argparse.Namespace, output: OutputFn) -> int:
+    """Nox fork: one sensing call from the command line, same routes as MCP."""
+    from .api import asense
+
+    options: dict[str, object] = {
+        "question": args.question,
+        "detail": args.detail,
+        "language": args.language,
+    }
+    if args.kind != "image":
+        options["start_seconds"] = args.start_seconds
+        options["end_seconds"] = args.end_seconds
+    if args.kind == "video":
+        options["include_audio"] = not args.no_audio
+    try:
+        result = asyncio.run(
+            asense(args.kind, str(Path(args.path).expanduser().resolve()),
+                   services=services, **options)
+        )
+    except SensoryError as error:
+        output(json.dumps(error_result(error), ensure_ascii=False))
+        return 1
+    except ValueError as error:
+        output(json.dumps({"status": "error", "error": {"message": str(error)}}))
+        return 2
+    if args.json:
+        output(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        output(str(result["text"]))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cove-sensory-mcp")
     parser.add_argument("--version", action="store_true")
@@ -828,6 +862,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--yes",
         action="store_true",
         help="Confirm Provider quota use without an interactive prompt.",
+    )
+    sense_parser = subparsers.add_parser(
+        "sense", help="Sense one local media file without MCP (prints the report)."
+    )
+    sense_parser.add_argument("kind", choices=("image", "video", "audio", "music"))
+    sense_parser.add_argument("path")
+    sense_parser.add_argument("--question", "-q", default="")
+    sense_parser.add_argument(
+        "--detail", choices=("auto", "quick", "detailed"), default="auto"
+    )
+    sense_parser.add_argument("--language", default="zh-CN")
+    sense_parser.add_argument("--start", type=float, default=None, dest="start_seconds")
+    sense_parser.add_argument("--end", type=float, default=None, dest="end_seconds")
+    sense_parser.add_argument(
+        "--no-audio", action="store_true", help="video: watch the picture only."
+    )
+    sense_parser.add_argument(
+        "--json", action="store_true", help="Print the full structured report as JSON."
     )
     print_config_parser = subparsers.add_parser(
         "print-config", help="Print a secret-free local stdio MCP client configuration."
@@ -866,6 +918,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             input_fn=input,
             yes=args.yes,
         )
+    if args.command == "sense":
+        return run_sense(_build_services(), args, output=print)
     if args.command == "print-config":
         executable = args.executable or Path(sys.argv[0])
         print(render_client_config(args.client, executable), end="")
